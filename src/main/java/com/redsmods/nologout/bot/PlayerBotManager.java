@@ -1,0 +1,419 @@
+package com.redsmods.nologout.bot;
+
+import carpet.patches.EntityPlayerMPFake;
+import carpet.patches.FakeClientConnection;
+import com.mojang.authlib.GameProfile;
+import com.mojang.serialization.DynamicOps;
+import com.redsmods.nologout.data.PlayerSnapshot;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
+import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ClientInformation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.storage.LevelResource;
+import net.minecraft.world.phys.Vec3;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+public class PlayerBotManager {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("nologout");
+
+    private static final Map<UUID, EntityPlayerMPFake> activeBots = new HashMap<>();
+    private static final Map<UUID, PlayerSnapshot> cachedSnapshots = new HashMap<>();
+
+    // -------------------------------------------------------------------------
+    // Called from mixin on player disconnect
+    // -------------------------------------------------------------------------
+
+    public static void onPlayerLeave(ServerPlayer player, MinecraftServer server) {
+        if (player.gameMode.getGameModeForPlayer() != GameType.SURVIVAL) return;
+
+        if (activeBots.containsKey(player.getUUID())) {
+            removeBotFor(player.getUUID());
+        }
+
+        PlayerSnapshot snap = PlayerSnapshot.capture(player);
+        cachedSnapshots.put(snap.ownerUUID, snap);
+        saveSnapshot(snap, server);
+        spawnBot(snap, server);
+    }
+
+    // -------------------------------------------------------------------------
+    // Called from mixin on player join
+    // -------------------------------------------------------------------------
+
+    public static void onPlayerJoin(ServerPlayer player, MinecraftServer server) {
+        UUID uuid = player.getUUID();
+
+        EntityPlayerMPFake bot = activeBots.get(uuid);
+        if (bot != null) {
+            restoreFromBot(player, bot);
+            activeBots.remove(uuid);
+            cachedSnapshots.remove(uuid);
+            deleteSnapshot(uuid, server);
+            return;
+        }
+
+        PlayerSnapshot snap = loadSnapshot(uuid, server);
+        if (snap != null) {
+            restoreFromSnapshot(player, snap, server);
+            cachedSnapshots.remove(uuid);
+            deleteSnapshot(uuid, server);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Spawn bot from snapshot
+    // -------------------------------------------------------------------------
+
+    private static void spawnBot(PlayerSnapshot snap, MinecraftServer server) {
+        ServerLevel level = server.getLevel(snap.dimensionKey);
+        if (level == null) {
+            LOGGER.warn("nologout: dimension {} not found for {}, falling back to overworld",
+                    snap.dimensionKey.identifier(), snap.ownerName);
+            level = server.overworld();
+        }
+
+        GameProfile profile = new GameProfile(UUID.randomUUID(), snap.ownerName + "_ghost");
+        EntityPlayerMPFake bot = EntityPlayerMPFake.respawnFake(server, level, profile,
+                ClientInformation.createDefault());
+
+        final ServerLevel finalLevel = level;
+        bot.fixStartingPosition = () -> bot.snapTo(
+                snap.position.x, snap.position.y, snap.position.z,
+                snap.yaw, snap.pitch);
+
+        server.getPlayerList().placeNewPlayer(
+                new FakeClientConnection(PacketFlow.SERVERBOUND),
+                bot,
+                new CommonListenerCookie(profile, 0, bot.clientInformation(), false));
+
+        bot.stopRiding();
+        bot.teleportTo(finalLevel,
+                snap.position.x, snap.position.y, snap.position.z,
+                Set.of(), snap.yaw, snap.pitch, true);
+        bot.unsetRemoved();
+
+        applySnapshotToBot(bot, snap);
+
+        bot.getAttribute(Attributes.STEP_HEIGHT).setBaseValue(0.6F);
+        bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
+//        bot.entityData.set(ServerPlayer.DATA_PLAYER_MODE_CUSTOMISATION, (byte) 0x7f);
+
+        server.getPlayerList().broadcastAll(
+                new ClientboundRotateHeadPacket(bot, (byte) (bot.yHeadRot * 256 / 360)),
+                snap.dimensionKey);
+        server.getPlayerList().broadcastAll(
+                ClientboundEntityPositionSyncPacket.of(bot),
+                snap.dimensionKey);
+
+        activeBots.put(snap.ownerUUID, bot);
+        LOGGER.info("nologout: spawned ghost bot for {}", snap.ownerName);
+    }
+
+    // -------------------------------------------------------------------------
+    // Apply snapshot state onto a bot
+    // -------------------------------------------------------------------------
+
+    private static void applySnapshotToBot(EntityPlayerMPFake bot, PlayerSnapshot snap) {
+        bot.setHealth(snap.health);
+        bot.setAbsorptionAmount(snap.absorption);
+        bot.getFoodData().setFoodLevel(snap.foodLevel);
+        bot.getFoodData().setSaturation(snap.saturation);
+        bot.experienceLevel = snap.xpLevel;
+        bot.experienceProgress = snap.xpProgress;
+        bot.totalExperience = snap.totalXp;
+
+        bot.getInventory().clearContent();
+        for (int i = 0; i < snap.inventoryItems.size(); i++) {
+            bot.getInventory().setItem(i, snap.inventoryItems.get(i).copy());
+        }
+        bot.getInventory().setSelectedSlot(snap.selectedSlot);
+
+        bot.removeAllEffects();
+        for (MobEffectInstance effect : snap.effects) {
+            bot.addEffect(new MobEffectInstance(effect));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Restore real player from live bot
+    // -------------------------------------------------------------------------
+
+    private static void restoreFromBot(ServerPlayer player, EntityPlayerMPFake bot) {
+        ServerLevel level = (ServerLevel) bot.level();
+        player.teleportTo(level,
+                bot.getX(), bot.getY(), bot.getZ(),
+                Set.of(), bot.getYRot(), bot.getXRot(), false);
+
+        player.setHealth(bot.getHealth());
+        player.setAbsorptionAmount(bot.getAbsorptionAmount());
+        player.getFoodData().setFoodLevel(bot.getFoodData().getFoodLevel());
+        player.getFoodData().setSaturation(bot.getFoodData().getSaturationLevel());
+        player.experienceLevel = bot.experienceLevel;
+        player.experienceProgress = bot.experienceProgress;
+        player.totalExperience = bot.totalExperience;
+        player.setScore(bot.getScore());
+
+        player.getInventory().clearContent();
+        for (int i = 0; i < bot.getInventory().getContainerSize(); i++) {
+            player.getInventory().setItem(i, bot.getInventory().getItem(i).copy());
+        }
+        player.getInventory().setSelectedSlot(bot.getInventory().getSelectedSlot());
+
+        player.removeAllEffects();
+        for (MobEffectInstance effect : bot.getActiveEffects()) {
+            player.addEffect(new MobEffectInstance(effect));
+        }
+
+        bot.kill(net.minecraft.network.chat.Component.literal("Player reconnected"));
+        LOGGER.info("nologout: restored {} from ghost bot", player.getGameProfile().name());
+    }
+
+    // -------------------------------------------------------------------------
+    // Restore real player from disk snapshot (bot died before reconnect)
+    // -------------------------------------------------------------------------
+
+    private static void restoreFromSnapshot(ServerPlayer player, PlayerSnapshot snap,
+                                            MinecraftServer server) {
+        ServerLevel level = server.getLevel(snap.dimensionKey);
+        if (level == null) level = server.overworld();
+
+        player.teleportTo(level,
+                snap.position.x, snap.position.y, snap.position.z,
+                Set.of(), snap.yaw, snap.pitch, false);
+
+        player.setHealth(snap.health);
+        player.setAbsorptionAmount(snap.absorption);
+        player.getFoodData().setFoodLevel(snap.foodLevel);
+        player.getFoodData().setSaturation(snap.saturation);
+        player.experienceLevel = snap.xpLevel;
+        player.experienceProgress = snap.xpProgress;
+        player.totalExperience = snap.totalXp;
+
+        player.getInventory().clearContent();
+        for (int i = 0; i < snap.inventoryItems.size(); i++) {
+            player.getInventory().setItem(i, snap.inventoryItems.get(i).copy());
+        }
+        player.getInventory().setSelectedSlot(snap.selectedSlot);
+
+        player.removeAllEffects();
+        for (MobEffectInstance effect : snap.effects) {
+            player.addEffect(new MobEffectInstance(effect));
+        }
+
+        LOGGER.info("nologout: restored {} from disk snapshot (bot had died)", snap.ownerName);
+    }
+
+    // -------------------------------------------------------------------------
+    // Cleanup
+    // -------------------------------------------------------------------------
+
+    public static void removeBotFor(UUID ownerUUID) {
+        EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
+        if (bot != null) {
+            bot.kill(net.minecraft.network.chat.Component.literal("Bot removed"));
+        }
+    }
+
+    public static boolean hasBotFor(UUID ownerUUID) {
+        return activeBots.containsKey(ownerUUID);
+    }
+
+    // -------------------------------------------------------------------------
+    // Snapshot file path
+    // -------------------------------------------------------------------------
+
+    private static File getSnapshotFile(UUID uuid, MinecraftServer server) {
+        File dir = new File(server.getWorldPath(LevelResource.ROOT).toFile(), "nologout");
+        //noinspection ResultOfMethodCallIgnored
+        dir.mkdirs();
+        return new File(dir, uuid + ".dat");
+    }
+
+    private static void saveSnapshot(PlayerSnapshot snap, MinecraftServer server) {
+        try {
+            CompoundTag tag = serializeSnapshot(snap, server);
+            NbtIo.writeCompressed(tag, getSnapshotFile(snap.ownerUUID, server).toPath());
+        } catch (IOException e) {
+            LOGGER.error("nologout: failed to save snapshot for {}", snap.ownerName, e);
+        }
+    }
+
+    private static PlayerSnapshot loadSnapshot(UUID uuid, MinecraftServer server) {
+        File file = getSnapshotFile(uuid, server);
+        if (!file.exists()) return null;
+        try {
+            CompoundTag tag = NbtIo.readCompressed(file.toPath(),
+                    net.minecraft.nbt.NbtAccounter.unlimitedHeap());
+            return deserializeSnapshot(tag, uuid, server);
+        } catch (IOException e) {
+            LOGGER.error("nologout: failed to load snapshot for {}", uuid, e);
+            return null;
+        }
+    }
+
+    private static void deleteSnapshot(UUID uuid, MinecraftServer server) {
+        File file = getSnapshotFile(uuid, server);
+        if (file.exists() && !file.delete()) {
+            LOGGER.warn("nologout: could not delete snapshot file for {}", uuid);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // NBT serialization
+    // -------------------------------------------------------------------------
+
+    private static CompoundTag serializeSnapshot(PlayerSnapshot snap, MinecraftServer server) {
+        CompoundTag tag = new CompoundTag();
+        RegistryAccess registries = server.registryAccess();
+        // RegistryOps wraps NbtOps with registry lookup so items/effects serialize correctly
+        DynamicOps<Tag> ops = registries.createSerializationContext(NbtOps.INSTANCE);
+
+        tag.putString("ownerUUID", snap.ownerUUID.toString());
+        tag.putString("ownerName", snap.ownerName);
+        // ResourceKey.location() gives the ResourceLocation (e.g. minecraft:overworld)
+        tag.putString("dimension", snap.dimensionKey.identifier().toString());
+        tag.putDouble("x", snap.position.x);
+        tag.putDouble("y", snap.position.y);
+        tag.putDouble("z", snap.position.z);
+        tag.putFloat("yaw", snap.yaw);
+        tag.putFloat("pitch", snap.pitch);
+        tag.putFloat("health", snap.health);
+        tag.putFloat("absorption", snap.absorption);
+        tag.putInt("foodLevel", snap.foodLevel);
+        tag.putFloat("saturation", snap.saturation);
+        tag.putFloat("exhaustion", snap.exhaustion);
+        tag.putInt("xpLevel", snap.xpLevel);
+        tag.putFloat("xpProgress", snap.xpProgress);
+        tag.putInt("totalXp", snap.totalXp);
+        tag.putInt("score", snap.score);
+        tag.putInt("selectedSlot", snap.selectedSlot);
+
+        // Inventory — use ItemStack.CODEC with RegistryOps
+        ListTag invList = new ListTag();
+        for (int i = 0; i < snap.inventoryItems.size(); i++) {
+            ItemStack stack = snap.inventoryItems.get(i);
+            if (!stack.isEmpty()) {
+                CompoundTag slotTag = new CompoundTag();
+                slotTag.putInt("slot", i);
+                // ItemStack.CODEC encodes to a Tag; cast is safe since NbtOps produces Tag
+                int finalI = i;
+                Tag itemTag = ItemStack.CODEC.encodeStart(ops, stack)
+                        .resultOrPartial(e -> LOGGER.error("nologout: failed to encode item at slot {}: {}", finalI, e))
+                        .orElse(null);
+                if (itemTag != null) {
+                    slotTag.put("item", itemTag);
+                    invList.add(slotTag);
+                }
+            }
+        }
+        tag.put("inventory", invList);
+
+        // Effects — MobEffectInstance.CODEC
+        ListTag effectList = new ListTag();
+        for (MobEffectInstance effect : snap.effects) {
+            Tag effectTag = MobEffectInstance.CODEC.encodeStart(ops, effect)
+                    .resultOrPartial(e -> LOGGER.error("nologout: failed to encode effect: {}", e))
+                    .orElse(null);
+            if (effectTag != null) {
+                effectList.add(effectTag);
+            }
+        }
+        tag.put("effects", effectList);
+
+        return tag;
+    }
+
+    private static PlayerSnapshot deserializeSnapshot(CompoundTag tag, UUID uuid,
+                                                      MinecraftServer server) {
+        PlayerSnapshot snap = new PlayerSnapshot();
+        RegistryAccess registries = server.registryAccess();
+        DynamicOps<Tag> ops = registries.createSerializationContext(NbtOps.INSTANCE);
+
+        // getUUID is gone — parse from string
+        snap.ownerUUID = UUID.fromString(tag.getString("ownerUUID").orElse(uuid.toString()));
+        // getString returns Optional<String> in 26.x
+        snap.ownerName = tag.getString("ownerName").orElse("unknown");
+
+        String dimStr = tag.getString("dimension").orElse("minecraft:overworld");
+        snap.dimensionKey = ResourceKey.create(Registries.DIMENSION,
+                Identifier.parse(dimStr));
+
+        snap.position = new Vec3(
+                tag.getDouble("x").orElse(0.0),
+                tag.getDouble("y").orElse(64.0),
+                tag.getDouble("z").orElse(0.0));
+        snap.yaw   = tag.getFloat("yaw").orElse(0f);
+        snap.pitch = tag.getFloat("pitch").orElse(0f);
+
+        snap.health     = tag.getFloat("health").orElse(20f);
+        snap.absorption = tag.getFloat("absorption").orElse(0f);
+        snap.foodLevel  = tag.getInt("foodLevel").orElse(20);
+        snap.saturation = tag.getFloat("saturation").orElse(5f);
+        snap.exhaustion = tag.getFloat("exhaustion").orElse(0f);
+        snap.xpLevel    = tag.getInt("xpLevel").orElse(0);
+        snap.xpProgress = tag.getFloat("xpProgress").orElse(0f);
+        snap.totalXp    = tag.getInt("totalXp").orElse(0);
+        snap.score      = tag.getInt("score").orElse(0);
+        snap.selectedSlot = tag.getInt("selectedSlot").orElse(0);
+
+        // Inventory
+        snap.inventoryItems = new ArrayList<>();
+        for (int i = 0; i < 41; i++) snap.inventoryItems.add(ItemStack.EMPTY);
+
+        ListTag invList = tag.getList("inventory").orElse(new ListTag());
+        for (int i = 0; i < invList.size(); i++) {
+            CompoundTag slotTag = invList.getCompound(i).orElse(null);
+            if (slotTag == null) continue;
+
+            int slot = slotTag.getInt("slot").orElse(-1);
+            if (slot < 0 || slot >= 41) continue;
+
+            Tag itemTag = slotTag.get("item").asCompound().orElse(null);
+            if (itemTag == null) continue;
+
+            ItemStack.CODEC.parse(ops, itemTag)
+                    .resultOrPartial(e -> LOGGER.error("nologout: failed to decode item at slot {}: {}", slot, e))
+                    .ifPresent(stack -> snap.inventoryItems.set(slot, stack));
+        }
+
+        // Effects
+        snap.effects = new ArrayList<>();
+        ListTag effectList = tag.getList("effects").orElse(new ListTag());
+        for (int i = 0; i < effectList.size(); i++) {
+            effectList.getCompound(i).ifPresent(effectTag ->
+                    MobEffectInstance.CODEC.parse(ops, effectTag)
+                            .resultOrPartial(e -> LOGGER.error("nologout: failed to decode effect: {}", e))
+                            .ifPresent(snap.effects::add)
+            );
+        }
+
+        return snap;
+    }
+}

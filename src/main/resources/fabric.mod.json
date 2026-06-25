@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "nologout",
+	"version": "${version}",
+	"name": "NoLogout",
+	"description": "No logging out :)",
+	"accessWidener": "nologout.accesswidener",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/nologout/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.redsmods.nologout.NoLogout"
+		]
+	},
+	"mixins": [
+		"nologout.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*",
+		"carpet": "*"
+	}
+}
