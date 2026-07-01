@@ -23,9 +23,11 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.portal.TeleportTransition;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
@@ -51,6 +53,7 @@ public class PlayerBotManager {
     // -------------------------------------------------------------------------
 
     public static void onPlayerLeave(ServerPlayer player, MinecraftServer server) {
+        if (player instanceof EntityPlayerMPFake) return;   // <-- ignore the bot's own disconnect
         if (player.gameMode.getGameModeForPlayer() != GameType.SURVIVAL) return;
 
         if (activeBots.containsKey(player.getUUID())) {
@@ -72,7 +75,14 @@ public class PlayerBotManager {
 
         EntityPlayerMPFake bot = activeBots.get(uuid);
         if (bot != null) {
-            restoreFromBot(player, bot);
+            if (bot.isRemoved() || bot.isDeadOrDying()) {
+                // The bot died (or was otherwise removed) while the real player was offline.
+                // Restoring from it would hand back a corpse's stale health/inventory instead
+                // of treating this like the death it was — so respawn the player instead.
+                handleOfflineDeath(player, bot, server);
+            } else {
+                restoreFromBot(player, bot);
+            }
             activeBots.remove(uuid);
             cachedSnapshots.remove(uuid);
             deleteSnapshot(uuid, server);
@@ -98,8 +108,11 @@ public class PlayerBotManager {
                     snap.dimensionKey.identifier(), snap.ownerName);
             level = server.overworld();
         }
-
-        GameProfile profile = new GameProfile(UUID.randomUUID(), snap.ownerName + "_ghost");
+        String ghostName = "-" + snap.ownerName;
+        if (ghostName.length() > 16) {
+            ghostName = ghostName.substring(0, 16);
+        }
+        GameProfile profile = new GameProfile(UUID.randomUUID(), ghostName);
         EntityPlayerMPFake bot = EntityPlayerMPFake.respawnFake(server, level, profile,
                 ClientInformation.createDefault());
 
@@ -193,6 +206,42 @@ public class PlayerBotManager {
 
         bot.kill(net.minecraft.network.chat.Component.literal("Player reconnected"));
         LOGGER.info("nologout: restored {} from ghost bot", player.getGameProfile().name());
+    }
+
+    // -------------------------------------------------------------------------
+    // Bot died while the player was offline — treat it as a real death
+    // -------------------------------------------------------------------------
+
+    private static void handleOfflineDeath(ServerPlayer player, EntityPlayerMPFake bot, MinecraftServer server) {
+        player.getInventory().clearContent();
+        player.removeAllEffects();
+        player.setHealth(player.getMaxHealth());
+        player.getFoodData().setFoodLevel(20);
+        player.getFoodData().setSaturation(5.0F);
+        player.experienceLevel = 0;
+        player.experienceProgress = 0f;
+        player.totalExperience = 0;
+
+        // Reuses the same resolution vanilla uses on a real death: validates the player's bed/
+        // respawn anchor is still standing and usable, consumes an anchor charge if so, and
+        // falls back to world spawn (via TeleportTransition.missingRespawnBlock) if it's gone,
+        // unset, or in an unloaded/invalid dimension.
+        TeleportTransition respawnTransition = player.findRespawnPositionAndUseSpawnBlock(true, TeleportTransition.DO_NOTHING);
+        player.teleport(respawnTransition);
+
+        if (!bot.isRemoved()) {
+            bot.getInventory().clearContent();
+            bot.kill(net.minecraft.network.chat.Component.literal("Player reconnected"));
+        }
+
+        AttributeInstance attr = player.getAttribute(Attributes.MAX_HEALTH);
+        if (attr == null) return;
+
+        double newMax = attr.getBaseValue() - 2.0;
+        attr.setBaseValue(Math.max(1.0, newMax));
+
+        LOGGER.info("nologout: {} reconnected to find their ghost bot had died — respawned with an empty inventory",
+                player.getGameProfile().name());
     }
 
     // -------------------------------------------------------------------------
