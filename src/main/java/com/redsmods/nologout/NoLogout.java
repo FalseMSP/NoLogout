@@ -1,6 +1,8 @@
 package com.redsmods.nologout;
 
+import com.redsmods.nologout.bot.PlayerBotManager;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 
 import net.minecraft.resources.Identifier;
 
@@ -22,6 +24,9 @@ public class NoLogout implements ModInitializer {
 		// Proceed with mild caution.
 
 		LOGGER.info("Hello Fabric world!");
+
+		// Clears bots' red "combat-log" nametag once their punishment window expires.
+		ServerTickEvents.END_SERVER_TICK.register(PlayerBotManager::tick);
 	}
 
 	public static Identifier id(String path) {

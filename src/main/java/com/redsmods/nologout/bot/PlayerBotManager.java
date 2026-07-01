@@ -12,6 +12,7 @@ import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
+import net.minecraft.ChatFormatting;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
@@ -30,16 +31,15 @@ import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.portal.TeleportTransition;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.scores.PlayerTeam;
+import net.minecraft.world.scores.Scoreboard;
+import net.minecraft.world.scores.TeamColor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 
 public class PlayerBotManager {
 
@@ -47,6 +47,29 @@ public class PlayerBotManager {
 
     private static final Map<UUID, EntityPlayerMPFake> activeBots = new HashMap<>();
     private static final Map<UUID, PlayerSnapshot> cachedSnapshots = new HashMap<>();
+
+    // -------------------------------------------------------------------------
+    // Combat-log punishment window
+    // -------------------------------------------------------------------------
+
+    // How long after logging off the bot counts as "freshly logged off" for
+    // punishment purposes. Also how long the bot displays a red nametag.
+    private static final long COMBAT_LOG_WINDOW_MS = 60 * 1000L;
+
+    // Team used purely to color the bot's nametag red during the window above.
+    private static final String DANGER_TEAM_NAME = "nologout_danger";
+
+    // ownerUUID -> real-world timestamp (millis) the bot was spawned
+    private static final Map<UUID, Long> botSpawnTimestamps = new HashMap<>();
+
+    // ownerUUID -> true if the bot died while inside the punishment window and
+    // the owner still needs to be struck down the next time they log back in
+    private static final Map<UUID, Boolean> pendingCombatLogDeath = new HashMap<>();
+
+    // bot UUID -> suppressed while we deliberately kill a bot ourselves (reconnect,
+    // manual removal, offline-death cleanup, etc.) so the die() mixin's call into
+    // onBotDeath only fires for real, unexpected deaths.
+    private static final Set<UUID> suppressedDeaths = new HashSet<>();
 
     // -------------------------------------------------------------------------
     // Called from mixin on player disconnect
@@ -57,7 +80,7 @@ public class PlayerBotManager {
         if (player.gameMode.getGameModeForPlayer() != GameType.SURVIVAL) return;
 
         if (activeBots.containsKey(player.getUUID())) {
-            removeBotFor(player.getUUID());
+            removeBotFor(player.getUUID(), server);
         }
 
         PlayerSnapshot snap = PlayerSnapshot.capture(player);
@@ -86,6 +109,9 @@ public class PlayerBotManager {
             activeBots.remove(uuid);
             cachedSnapshots.remove(uuid);
             deleteSnapshot(uuid, server);
+            botSpawnTimestamps.remove(uuid);
+            // Reconnecting to a still-alive bot is the safe path — no punishment.
+            pendingCombatLogDeath.remove(uuid);
             return;
         }
 
@@ -95,6 +121,13 @@ public class PlayerBotManager {
             cachedSnapshots.remove(uuid);
             deleteSnapshot(uuid, server);
         }
+
+        // If the bot died inside the combat-log window, the player pays for it
+        // the moment they set foot back in the world.
+        if (Boolean.TRUE.equals(pendingCombatLogDeath.remove(uuid))) {
+            killPlayerInstantly(player);
+        }
+        botSpawnTimestamps.remove(uuid);
     }
 
     // -------------------------------------------------------------------------
@@ -137,6 +170,14 @@ public class PlayerBotManager {
         bot.getAttribute(Attributes.STEP_HEIGHT).setBaseValue(0.6F);
         bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
 //        bot.entityData.set(ServerPlayer.DATA_PLAYER_MODE_CUSTOMISATION, (byte) 0x7f);
+
+        // Keep the bot off other players' locator bars entirely.
+        bot.getAttribute(Attributes.WAYPOINT_TRANSMIT_RANGE).setBaseValue(0.0D);
+
+        // Start the combat-log punishment window and flag the bot red for its duration.
+        botSpawnTimestamps.put(snap.ownerUUID, System.currentTimeMillis());
+        pendingCombatLogDeath.remove(snap.ownerUUID);
+        applyDangerNameTag(bot, server);
 
         server.getPlayerList().broadcastAll(
                 new ClientboundRotateHeadPacket(bot, (byte) (bot.yHeadRot * 256 / 360)),
@@ -204,7 +245,9 @@ public class PlayerBotManager {
             player.addEffect(new MobEffectInstance(effect));
         }
 
-        bot.kill(net.minecraft.network.chat.Component.literal("Player reconnected"));
+        String botScoreboardName = bot.getScoreboardName();
+        killBotQuietly(bot, "Player reconnected");
+        removeDangerNameTag(botScoreboardName, player.level().getServer());
         LOGGER.info("nologout: restored {} from ghost bot", player.getGameProfile().name());
     }
 
@@ -231,7 +274,7 @@ public class PlayerBotManager {
 
         if (!bot.isRemoved()) {
             bot.getInventory().clearContent();
-            bot.kill(net.minecraft.network.chat.Component.literal("Player reconnected"));
+            killBotQuietly(bot, "Player reconnected");
         }
 
         AttributeInstance attr = player.getAttribute(Attributes.MAX_HEALTH);
@@ -283,15 +326,136 @@ public class PlayerBotManager {
     // Cleanup
     // -------------------------------------------------------------------------
 
+    // Kills a bot on purpose (reconnect, manual removal, etc.) without letting
+    // that death be mistaken for a real one by the die() mixin.
+    private static void killBotQuietly(EntityPlayerMPFake bot, String reason) {
+        suppressedDeaths.add(bot.getUUID());
+        try {
+            bot.kill(net.minecraft.network.chat.Component.literal(reason));
+        } finally {
+            suppressedDeaths.remove(bot.getUUID());
+        }
+    }
+
     public static void removeBotFor(UUID ownerUUID) {
         EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
         if (bot != null) {
-            bot.kill(net.minecraft.network.chat.Component.literal("Bot removed"));
+            killBotQuietly(bot, "Bot removed");
         }
+        botSpawnTimestamps.remove(ownerUUID);
+    }
+
+    // Prefer this overload wherever a MinecraftServer is available so the
+    // bot's scoreboard team membership (used for the red nametag) is cleaned up.
+    public static void removeBotFor(UUID ownerUUID, MinecraftServer server) {
+        EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
+        if (bot != null) {
+            killBotQuietly(bot, "Bot removed");
+            removeDangerNameTag(bot.getScoreboardName(), server);
+        }
+        botSpawnTimestamps.remove(ownerUUID);
     }
 
     public static boolean hasBotFor(UUID ownerUUID) {
         return activeBots.containsKey(ownerUUID);
+    }
+
+    // -------------------------------------------------------------------------
+    // Bot death hook — call this from the mixin that detects the fake player's
+    // real death (fall damage, mobs, PvP, etc.), NOT from the manual kill()
+    // calls above/in restoreFromBot, which represent the "safe" reconnect path.
+    // -------------------------------------------------------------------------
+
+    // Entry point for the mixin injected into ServerPlayer#die. Fires for every
+    // player death, so it filters down to real, untracked bot deaths before
+    // delegating to the UUID-keyed overload below.
+    public static void onBotDeath(ServerPlayer player, MinecraftServer server) {
+        if (!(player instanceof EntityPlayerMPFake bot)) return;
+        if (suppressedDeaths.contains(bot.getUUID())) return; // one of our own kill() calls
+
+        UUID ownerUUID = null;
+        for (Map.Entry<UUID, EntityPlayerMPFake> entry : activeBots.entrySet()) {
+            if (entry.getValue() == bot) {
+                ownerUUID = entry.getKey();
+                break;
+            }
+        }
+        if (ownerUUID == null) return; // not a bot we're currently tracking
+
+        onBotDeath(ownerUUID, server);
+    }
+
+    public static void onBotDeath(UUID ownerUUID, MinecraftServer server) {
+        Long spawnTime = botSpawnTimestamps.remove(ownerUUID);
+        boolean withinWindow = spawnTime != null
+                && (System.currentTimeMillis() - spawnTime) <= COMBAT_LOG_WINDOW_MS;
+
+        if (withinWindow) {
+            pendingCombatLogDeath.put(ownerUUID, Boolean.TRUE);
+            LOGGER.info("nologout: bot for {} died within the combat-log window; " +
+                    "owner will be struck down on rejoin", ownerUUID);
+        }
+
+//        EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
+//        if (bot != null) {
+//            removeDangerNameTag(bot.getScoreboardName(), server);
+//        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Periodic upkeep — call this once every second or so from an existing
+    // server tick hook so bots' nametags turn back to normal once the
+    // combat-log window has passed (punishment logic itself doesn't depend
+    // on this being called, since onBotDeath checks elapsed time directly).
+    // -------------------------------------------------------------------------
+
+    public static void tick(MinecraftServer server) {
+        if (botSpawnTimestamps.isEmpty()) return;
+
+        long now = System.currentTimeMillis();
+        for (UUID ownerUUID : new ArrayList<>(botSpawnTimestamps.keySet())) {
+            Long spawnTime = botSpawnTimestamps.get(ownerUUID);
+            if (spawnTime == null || now - spawnTime <= COMBAT_LOG_WINDOW_MS) continue;
+
+            EntityPlayerMPFake bot = activeBots.get(ownerUUID);
+            if (bot != null) {
+                removeDangerNameTag(bot.getScoreboardName(), server);
+            }
+            botSpawnTimestamps.remove(ownerUUID);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Red nametag helpers (purely cosmetic — scoreboard team color)
+    // -------------------------------------------------------------------------
+
+    private static void applyDangerNameTag(EntityPlayerMPFake bot, MinecraftServer server) {
+        Scoreboard scoreboard = server.getScoreboard();
+        PlayerTeam team = scoreboard.getPlayerTeam(DANGER_TEAM_NAME);
+        if (team == null) {
+            team = scoreboard.addPlayerTeam(DANGER_TEAM_NAME);
+            team.setColor(Optional.of(TeamColor.RED));
+        }
+        scoreboard.addPlayerToTeam(bot.getScoreboardName(), team);
+    }
+
+    private static void removeDangerNameTag(String scoreboardName, MinecraftServer server) {
+        Scoreboard scoreboard = server.getScoreboard();
+        PlayerTeam team = scoreboard.getPlayersTeam(scoreboardName);
+        if (team != null && team.getName().equals(DANGER_TEAM_NAME)) {
+            scoreboard.removePlayerFromTeam(scoreboardName, team);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Combat-log punishment — instantly kills a returning player
+    // -------------------------------------------------------------------------
+
+    private static void killPlayerInstantly(ServerPlayer player) {
+        player.setHealth(0.0F);
+        player.die(player.damageSources().generic());
+        LOGGER.info("nologout: {} logged back in after a combat-log death and was struck down",
+                player.getGameProfile().name());
     }
 
     // -------------------------------------------------------------------------
