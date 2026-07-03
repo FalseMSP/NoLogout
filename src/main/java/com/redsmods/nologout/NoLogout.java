@@ -2,6 +2,7 @@ package com.redsmods.nologout;
 
 import com.redsmods.nologout.bot.PlayerBotManager;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 
 import net.minecraft.resources.Identifier;
@@ -27,6 +28,11 @@ public class NoLogout implements ModInitializer {
 
 		// Clears bots' red "combat-log" nametag once their punishment window expires.
 		ServerTickEvents.END_SERVER_TICK.register(PlayerBotManager::tick);
+
+		// Brings back any ghost bots (and pending combat-log punishments) that were
+		// still active when the server was last stopped, so a restart can't be used
+		// to erase them.
+		ServerLifecycleEvents.SERVER_STARTED.register(PlayerBotManager::restoreAllOnStartup);
 	}
 
 	public static Identifier id(String path) {

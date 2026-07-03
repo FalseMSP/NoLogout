@@ -66,6 +66,11 @@ public class PlayerBotManager {
     // the owner still needs to be struck down the next time they log back in
     private static final Map<UUID, Boolean> pendingCombatLogDeath = new HashMap<>();
 
+    // ownerUUID -> true if the bot died OUTSIDE the punishment window and the
+    // owner still needs the softer "offline death" penalty applied on rejoin
+    // (empty inventory, -2 max health, respawn at bed/world spawn).
+    private static final Map<UUID, Boolean> offlineDeathPending = new HashMap<>();
+
     // bot UUID -> suppressed while we deliberately kill a bot ourselves (reconnect,
     // manual removal, offline-death cleanup, etc.) so the die() mixin's call into
     // onBotDeath only fires for real, unexpected deaths.
@@ -85,8 +90,13 @@ public class PlayerBotManager {
 
         PlayerSnapshot snap = PlayerSnapshot.capture(player);
         cachedSnapshots.put(snap.ownerUUID, snap);
-        saveSnapshot(snap, server);
-        spawnBot(snap, server);
+
+        // Captured once and threaded through both the on-disk record and the
+        // in-memory map so the punishment window survives a server restart
+        // instead of silently resetting.
+        long spawnTimestamp = System.currentTimeMillis();
+        saveSnapshot(snap, spawnTimestamp, false, server);
+        spawnBot(snap, server, spawnTimestamp);
     }
 
     // -------------------------------------------------------------------------
@@ -98,8 +108,10 @@ public class PlayerBotManager {
         UUID uuid = player.getUUID();
 
         // If the bot died inside the combat-log window, the player pays for it
-        // the moment they set foot back in the world.
-        EntityPlayerMPFake bot = activeBots.get(uuid);
+        // the moment they set foot back in the world. This flag (and the
+        // matching on-disk copy) survives a restart, so this fires correctly
+        // even if the server went down between the bot's death and the
+        // player's next login.
         if (Boolean.TRUE.equals(pendingCombatLogDeath.remove(uuid))) {
             // clear their items bc their bot aldr dropped all the stuff
             player.getInventory().clearContent();
@@ -111,24 +123,29 @@ public class PlayerBotManager {
             player.experienceProgress = 0f;
             player.totalExperience = 0;
             killPlayerInstantly(player);
+
+            cleanupTrackingFor(uuid, server);
             return;
         }
 
+        // Same idea, but for a bot that died OUTSIDE the window — softer
+        // penalty, no instant kill. This is checked here (persisted flag)
+        // rather than by inspecting a live bot object, so it's correct
+        // whether the bot died five seconds ago or the server restarted
+        // in between.
+        if (Boolean.TRUE.equals(offlineDeathPending.remove(uuid))) {
+            handleOfflineDeath(player);
+            cleanupTrackingFor(uuid, server);
+            return;
+        }
+
+        // Any bot still tracked here is guaranteed alive — dead bots are
+        // removed from this map (and discarded) the instant onBotDeath fires,
+        // so there's no isRemoved()/isDeadOrDying() check needed anymore.
+        EntityPlayerMPFake bot = activeBots.get(uuid);
         if (bot != null) {
-            if (bot.isRemoved() || bot.isDeadOrDying()) {
-                // The bot died (or was otherwise removed) while the real player was offline.
-                // Restoring from it would hand back a corpse's stale health/inventory instead
-                // of treating this like the death it was — so respawn the player instead.
-                handleOfflineDeath(player, bot, server);
-            } else {
-                restoreFromBot(player, bot);
-            }
-            activeBots.remove(uuid);
-            cachedSnapshots.remove(uuid);
-            deleteSnapshot(uuid, server);
-            botSpawnTimestamps.remove(uuid);
-            // Reconnecting to a still-alive bot is the safe path — no punishment.
-            pendingCombatLogDeath.remove(uuid);
+            restoreFromBot(player, bot);
+            cleanupTrackingFor(uuid, server);
             return;
         }
 
@@ -142,11 +159,81 @@ public class PlayerBotManager {
         botSpawnTimestamps.remove(uuid);
     }
 
+    // The punishment/restore has now been paid or applied — clear whatever
+    // bookkeeping (in-memory or on-disk) was still hanging around for this player.
+    private static void cleanupTrackingFor(UUID uuid, MinecraftServer server) {
+        activeBots.remove(uuid);
+        cachedSnapshots.remove(uuid);
+        deleteSnapshot(uuid, server);
+        botSpawnTimestamps.remove(uuid);
+    }
+
+    // -------------------------------------------------------------------------
+    // Server-restart recovery
+    // -------------------------------------------------------------------------
+
+    // Call this once from the mod's server-started lifecycle hook (e.g.
+    // ServerLifecycleEvents.SERVER_STARTED on Fabric) so that any bots which
+    // were active when the server last went down come back instead of just
+    // vanishing along with their punishment state. Safe to call even if the
+    // nologout snapshot directory is empty.
+    public static void restoreAllOnStartup(MinecraftServer server) {
+        File dir = getSnapshotDir(server);
+        File[] files = dir.listFiles((d, name) -> name.endsWith(".dat"));
+        if (files == null || files.length == 0) return;
+
+        int restored = 0;
+        for (File file : files) {
+            String fileName = file.getName();
+            UUID ownerUUID;
+            try {
+                ownerUUID = UUID.fromString(fileName.substring(0, fileName.length() - ".dat".length()));
+            } catch (IllegalArgumentException e) {
+                LOGGER.warn("nologout: skipping unrecognized file in snapshot dir: {}", fileName);
+                continue;
+            }
+
+            SnapshotMeta meta = loadSnapshotWithMeta(ownerUUID, server);
+            if (meta == null) continue;
+
+            cachedSnapshots.put(ownerUUID, meta.snapshot());
+
+            if (meta.pendingCombatLogDeath()) {
+                // The bot had already died inside the punishment window before
+                // the restart. There's nothing to respawn — just remember that
+                // the owner still owes a death the next time they log in.
+                pendingCombatLogDeath.put(ownerUUID, Boolean.TRUE);
+                LOGGER.info("nologout: restored pending combat-log punishment for {}",
+                        meta.snapshot().ownerName);
+            } else if (meta.botDied()) {
+                // The bot died outside the window before the restart. Same
+                // deal, softer penalty — do NOT respawn it, or it comes back
+                // from the dead every time the server restarts.
+                offlineDeathPending.put(ownerUUID, Boolean.TRUE);
+                LOGGER.info("nologout: restored pending offline-death penalty for {}",
+                        meta.snapshot().ownerName);
+            } else {
+                // The bot was alive when the server went down. Bring it back so
+                // it keeps standing in for the offline player, continuing the
+                // same combat-log window it originally started with (not a
+                // fresh one) so a restart can't be used to dodge punishment.
+                spawnBot(meta.snapshot(), server, meta.spawnTimestamp());
+                LOGGER.info("nologout: respawned ghost bot for {} after restart",
+                        meta.snapshot().ownerName);
+            }
+            restored++;
+        }
+
+        if (restored > 0) {
+            LOGGER.info("nologout: restored {} offline player(s) after restart", restored);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Spawn bot from snapshot
     // -------------------------------------------------------------------------
 
-    private static void spawnBot(PlayerSnapshot snap, MinecraftServer server) {
+    private static void spawnBot(PlayerSnapshot snap, MinecraftServer server, long spawnTimestamp) {
         ServerLevel level = server.getLevel(snap.dimensionKey);
         if (level == null) {
             LOGGER.warn("nologout: dimension {} not found for {}, falling back to overworld",
@@ -186,8 +273,9 @@ public class PlayerBotManager {
         // Keep the bot off other players' locator bars entirely.
         bot.getAttribute(Attributes.WAYPOINT_TRANSMIT_RANGE).setBaseValue(0.0D);
 
-        // Start the combat-log punishment window and flag the bot red for its duration.
-        botSpawnTimestamps.put(snap.ownerUUID, System.currentTimeMillis());
+        // Start (or resume, after a restart) the combat-log punishment window
+        // and flag the bot red for the remainder of its duration.
+        botSpawnTimestamps.put(snap.ownerUUID, spawnTimestamp);
         pendingCombatLogDeath.remove(snap.ownerUUID);
         applyDangerNameTag(bot, server);
 
@@ -267,7 +355,7 @@ public class PlayerBotManager {
     // Bot died while the player was offline — treat it as a real death
     // -------------------------------------------------------------------------
 
-    private static void handleOfflineDeath(ServerPlayer player, EntityPlayerMPFake bot, MinecraftServer server) {
+    private static void handleOfflineDeath(ServerPlayer player) {
         player.getInventory().clearContent();
         player.removeAllEffects();
         player.setHealth(player.getMaxHealth());
@@ -284,10 +372,8 @@ public class PlayerBotManager {
         TeleportTransition respawnTransition = player.findRespawnPositionAndUseSpawnBlock(true, TeleportTransition.DO_NOTHING);
         player.teleport(respawnTransition);
 
-        if (!bot.isRemoved()) {
-            bot.getInventory().clearContent();
-            killBotQuietly(bot, "Player reconnected");
-        }
+        // The bot itself was already discarded back when it actually died
+        // (see onBotDeath) — nothing left to clean up here.
 
         AttributeInstance attr = player.getAttribute(Attributes.MAX_HEALTH);
         if (attr == null) return;
@@ -402,16 +488,34 @@ public class PlayerBotManager {
         boolean withinWindow = spawnTime != null
                 && (System.currentTimeMillis() - spawnTime) <= COMBAT_LOG_WINDOW_MS;
 
+        // Persist the outcome immediately, regardless of which case this is —
+        // if the server goes down before the owner reconnects, this on-disk
+        // flag (not the in-memory map, and NOT the bot entity) is what tells
+        // both onPlayerJoin() and restoreAllOnStartup() what happened. This is
+        // also what stops a dead bot from being respawned after a restart.
         if (withinWindow) {
             pendingCombatLogDeath.put(ownerUUID, Boolean.TRUE);
+            persistDeathFlag(ownerUUID, META_PENDING_COMBAT_LOG_DEATH, server);
             LOGGER.info("nologout: bot for {} died within the combat-log window; " +
                     "owner will be struck down on rejoin", ownerUUID);
+        } else {
+            offlineDeathPending.put(ownerUUID, Boolean.TRUE);
+            persistDeathFlag(ownerUUID, META_BOT_DIED, server);
+            LOGGER.info("nologout: bot for {} died outside the combat-log window; " +
+                    "owner will be respawned with a penalty on rejoin", ownerUUID);
         }
 
-//        EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
-//        if (bot != null) {
-//            removeDangerNameTag(bot.getScoreboardName(), server);
-//        }
+        // The bot has done its job — stop tracking it and get rid of the
+        // entity now rather than leaving a dead body around for the owner's
+        // eventual rejoin to clean up. discard() (not kill()) since it's
+        // already dead; this just removes it from the world.
+        EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
+        if (bot != null) {
+            removeDangerNameTag(bot.getScoreboardName(), server);
+            if (!bot.isRemoved()) {
+                bot.discard();
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -474,33 +578,84 @@ public class PlayerBotManager {
     // Snapshot file path
     // -------------------------------------------------------------------------
 
-    private static File getSnapshotFile(UUID uuid, MinecraftServer server) {
+    private static File getSnapshotDir(MinecraftServer server) {
         File dir = new File(server.getWorldPath(LevelResource.ROOT).toFile(), "nologout");
         //noinspection ResultOfMethodCallIgnored
         dir.mkdirs();
-        return new File(dir, uuid + ".dat");
+        return dir;
     }
 
-    private static void saveSnapshot(PlayerSnapshot snap, MinecraftServer server) {
+    private static File getSnapshotFile(UUID uuid, MinecraftServer server) {
+        return new File(getSnapshotDir(server), uuid + ".dat");
+    }
+
+    // -------------------------------------------------------------------------
+    // Persisted metadata alongside each snapshot (spawn time + pending
+    // combat-log death) so an active bot's punishment state survives a
+    // server restart instead of resetting along with the static maps above.
+    // -------------------------------------------------------------------------
+
+    private static final String META_SPAWN_TIMESTAMP = "spawnTimestamp";
+    private static final String META_PENDING_COMBAT_LOG_DEATH = "pendingCombatLogDeath";
+    private static final String META_BOT_DIED = "botDied";
+
+    private record SnapshotMeta(PlayerSnapshot snapshot, long spawnTimestamp,
+                                boolean pendingCombatLogDeath, boolean botDied) {}
+
+    private static void saveSnapshot(PlayerSnapshot snap, long spawnTimestamp,
+                                     boolean pendingCombatLogDeath, MinecraftServer server) {
         try {
             CompoundTag tag = serializeSnapshot(snap, server);
+            tag.putLong(META_SPAWN_TIMESTAMP, spawnTimestamp);
+            tag.putBoolean(META_PENDING_COMBAT_LOG_DEATH, pendingCombatLogDeath);
+            tag.putBoolean(META_BOT_DIED, false); // freshly spawned, definitionally alive
             NbtIo.writeCompressed(tag, getSnapshotFile(snap.ownerUUID, server).toPath());
         } catch (IOException e) {
             LOGGER.error("nologout: failed to save snapshot for {}", snap.ownerName, e);
         }
     }
 
-    private static PlayerSnapshot loadSnapshot(UUID uuid, MinecraftServer server) {
+    // Flips a single boolean flag on an already-saved snapshot file, without
+    // re-deriving the rest of the NBT from a PlayerSnapshot object. Called
+    // from onBotDeath so the outcome hits disk the moment it's known, rather
+    // than only at the next full save (which may never come if the bot just
+    // died and there's nothing left to save).
+    private static void persistDeathFlag(UUID ownerUUID, String flagKey, MinecraftServer server) {
+        File file = getSnapshotFile(ownerUUID, server);
+        if (!file.exists()) {
+            LOGGER.warn("nologout: no on-disk snapshot to mark {} for {}", flagKey, ownerUUID);
+            return;
+        }
+        try {
+            CompoundTag tag = NbtIo.readCompressed(file.toPath(),
+                    net.minecraft.nbt.NbtAccounter.unlimitedHeap());
+            tag.putBoolean(flagKey, true);
+            NbtIo.writeCompressed(tag, file.toPath());
+        } catch (IOException e) {
+            LOGGER.error("nologout: failed to persist {} for {}", flagKey, ownerUUID, e);
+        }
+    }
+
+    private static SnapshotMeta loadSnapshotWithMeta(UUID uuid, MinecraftServer server) {
         File file = getSnapshotFile(uuid, server);
         if (!file.exists()) return null;
         try {
             CompoundTag tag = NbtIo.readCompressed(file.toPath(),
                     net.minecraft.nbt.NbtAccounter.unlimitedHeap());
-            return deserializeSnapshot(tag, uuid, server);
+            PlayerSnapshot snap = deserializeSnapshot(tag, uuid, server);
+            long spawnTimestamp = tag.getLong(META_SPAWN_TIMESTAMP).orElse(0L);
+            boolean pendingCombatLogDeath = tag.getBoolean(META_PENDING_COMBAT_LOG_DEATH).orElse(false);
+            boolean botDied = tag.getBoolean(META_BOT_DIED).orElse(false);
+            return new SnapshotMeta(snap, spawnTimestamp, pendingCombatLogDeath, botDied);
         } catch (IOException e) {
             LOGGER.error("nologout: failed to load snapshot for {}", uuid, e);
             return null;
         }
+    }
+
+    private static PlayerSnapshot loadSnapshot(UUID uuid, MinecraftServer server) {
+        SnapshotMeta meta = loadSnapshotWithMeta(uuid, server);
+        return meta == null ? null : meta.snapshot();
     }
 
     private static void deleteSnapshot(UUID uuid, MinecraftServer server) {
