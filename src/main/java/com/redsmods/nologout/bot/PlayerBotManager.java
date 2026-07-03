@@ -94,9 +94,26 @@ public class PlayerBotManager {
     // -------------------------------------------------------------------------
 
     public static void onPlayerJoin(ServerPlayer player, MinecraftServer server) {
+        if (player.gameMode() == GameType.SPECTATOR) return;
         UUID uuid = player.getUUID();
 
+        // If the bot died inside the combat-log window, the player pays for it
+        // the moment they set foot back in the world.
         EntityPlayerMPFake bot = activeBots.get(uuid);
+        if (Boolean.TRUE.equals(pendingCombatLogDeath.remove(uuid))) {
+            // clear their items bc their bot aldr dropped all the stuff
+            player.getInventory().clearContent();
+            player.removeAllEffects();
+            player.setHealth(player.getMaxHealth());
+            player.getFoodData().setFoodLevel(20);
+            player.getFoodData().setSaturation(5.0F);
+            player.experienceLevel = 0;
+            player.experienceProgress = 0f;
+            player.totalExperience = 0;
+            killPlayerInstantly(player);
+            return;
+        }
+
         if (bot != null) {
             if (bot.isRemoved() || bot.isDeadOrDying()) {
                 // The bot died (or was otherwise removed) while the real player was offline.
@@ -122,11 +139,6 @@ public class PlayerBotManager {
             deleteSnapshot(uuid, server);
         }
 
-        // If the bot died inside the combat-log window, the player pays for it
-        // the moment they set foot back in the world.
-        if (Boolean.TRUE.equals(pendingCombatLogDeath.remove(uuid))) {
-            killPlayerInstantly(player);
-        }
         botSpawnTimestamps.remove(uuid);
     }
 
