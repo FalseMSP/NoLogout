@@ -7,6 +7,7 @@ import com.mojang.authlib.properties.Property;
 import com.mojang.authlib.properties.PropertyMap;
 import com.mojang.serialization.DynamicOps;
 import com.redsmods.nologout.data.PlayerSnapshot;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
@@ -31,6 +32,8 @@ import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.portal.TeleportTransition;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
@@ -50,6 +53,15 @@ public class PlayerBotManager {
 
     private static final Map<UUID, EntityPlayerMPFake> activeBots = new HashMap<>();
     private static final Map<UUID, PlayerSnapshot> cachedSnapshots = new HashMap<>();
+
+    // -------------------------------------------------------------------------
+    // Summoning-circle safe log-off
+    // -------------------------------------------------------------------------
+
+    // How far (in blocks, each axis) to look around the player for a
+    // summoning circle's marker block. Mirrors the circle mod's own search
+    // radius so "inside the circle" means the same thing in both mods.
+    private static final int CIRCLE_CHECK_RADIUS = 1;
 
     // -------------------------------------------------------------------------
     // Combat-log punishment window
@@ -92,6 +104,14 @@ public class PlayerBotManager {
             removeBotFor(player.getUUID(), server);
         }
 
+        // Logging off standing inside a summoning circle is treated as a safe
+        // log-off: no ghost bot stands in for the player, and none of the
+        // combat-log punishment bookkeeping below is started. This is a
+        // vanilla-equivalent disconnect from here on.
+        if (isInsideSummoningCircle(player)) {
+            return;
+        }
+
         PlayerSnapshot snap = PlayerSnapshot.capture(player);
         cachedSnapshots.put(snap.ownerUUID, snap);
 
@@ -101,6 +121,24 @@ public class PlayerBotManager {
         long spawnTimestamp = System.currentTimeMillis();
         saveSnapshot(snap, spawnTimestamp, false, server);
         spawnBot(snap, server, spawnTimestamp);
+    }
+
+    // True if a summoning circle's Blocks.STRUCTURE_VOID marker block is
+    // within CIRCLE_CHECK_RADIUS of the player on every axis. Deliberately
+    // checks for the marker block itself rather than reaching into the
+    // summoning-circle mod's internal state, since the two mods are
+    // otherwise independent of each other.
+    private static boolean isInsideSummoningCircle(ServerPlayer player) {
+        BlockPos center = player.blockPosition();
+        for (BlockPos pos : BlockPos.betweenClosed(
+                center.offset(-CIRCLE_CHECK_RADIUS, -CIRCLE_CHECK_RADIUS, -CIRCLE_CHECK_RADIUS),
+                center.offset(CIRCLE_CHECK_RADIUS, CIRCLE_CHECK_RADIUS, CIRCLE_CHECK_RADIUS))) {
+            if (player.level().getBlockState(pos).is(Blocks.STRUCTURE_VOID)) {
+                player.level().setBlock(pos, Blocks.AIR.defaultBlockState(),0,0);
+                return true;
+            }
+        }
+        return false;
     }
 
     // -------------------------------------------------------------------------
