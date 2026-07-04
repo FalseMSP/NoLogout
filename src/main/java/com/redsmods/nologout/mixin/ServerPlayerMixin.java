@@ -42,6 +42,10 @@ public abstract class ServerPlayerMixin {
 							Component.literal("Place this on a corpse, drop a totem")
 									.withStyle(style -> style.withItalic(false).withColor(ChatFormatting.GRAY)),
 							Component.literal("of undying to revive; player has to be online")
+									.withStyle(style -> style.withItalic(false).withColor(ChatFormatting.GRAY)),
+							Component.literal("Throw with a golden apple to gain a")
+									.withStyle(style -> style.withItalic(false).withColor(ChatFormatting.GRAY)),
+							Component.literal("permanent heart (max 10)")
 									.withStyle(style -> style.withItalic(false).withColor(ChatFormatting.GRAY))
 					)));
 

@@ -1,5 +1,6 @@
 package com.redsmods.nologout.data;
 
+import com.mojang.authlib.properties.PropertyMap;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.effect.MobEffectInstance;
@@ -30,6 +31,11 @@ public class PlayerSnapshot {
     public List<MobEffectInstance> effects; // Mojmap name, not StatusEffects
     public int selectedSlot;
     public int score;
+    // Skin/cape/etc texture properties from the real player's GameProfile, so
+    // the fake bot can be made to look like the player it's standing in for.
+    // Assigned in capture()/deserialize — left null here since PropertyMap
+    // can't be mutated after construction (see capture() for why).
+    public PropertyMap skinProperties;
 
     // Capture all state from a live player
     public static PlayerSnapshot capture(ServerPlayer player) {
@@ -68,6 +74,11 @@ public class PlayerSnapshot {
         for (MobEffectInstance effect : player.getActiveEffects()) {
             snap.effects.add(new MobEffectInstance(effect));
         }
+
+        com.google.common.collect.Multimap<String, com.mojang.authlib.properties.Property> props =
+                com.google.common.collect.HashMultimap.create();
+        props.putAll(player.getGameProfile().properties());
+        snap.skinProperties = new PropertyMap(props);
 
         return snap;
     }

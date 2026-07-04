@@ -3,6 +3,8 @@ package com.redsmods.nologout.bot;
 import carpet.patches.EntityPlayerMPFake;
 import carpet.patches.FakeClientConnection;
 import com.mojang.authlib.GameProfile;
+import com.mojang.authlib.properties.Property;
+import com.mojang.authlib.properties.PropertyMap;
 import com.mojang.serialization.DynamicOps;
 import com.redsmods.nologout.data.PlayerSnapshot;
 import net.minecraft.core.RegistryAccess;
@@ -24,6 +26,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.ItemStack;
@@ -75,6 +78,7 @@ public class PlayerBotManager {
     // manual removal, offline-death cleanup, etc.) so the die() mixin's call into
     // onBotDeath only fires for real, unexpected deaths.
     private static final Set<UUID> suppressedDeaths = new HashSet<>();
+    private static final String HIDDEN_TEAM_NAME = "nologout_hidden";
 
     // -------------------------------------------------------------------------
     // Called from mixin on player disconnect
@@ -230,6 +234,51 @@ public class PlayerBotManager {
     }
 
     // -------------------------------------------------------------------------
+    // Bot GameProfile construction
+    // -------------------------------------------------------------------------
+
+    // As of the 26.1 unobfuscated rework, a freshly constructed GameProfile's
+    // properties() comes back as an immutable, empty PropertyMap — putAll()/
+    // put() on it always throws UnsupportedOperationException, unlike older
+    // versions where it was backed by a mutable HashMultimap. There's no
+    // documented public constructor for pre-populating it either, so this
+    // tries a 3-arg constructor first (in case one exists on this version)
+    // and falls back to patching the private field via reflection. If both
+    // fail, the bot still spawns — just with a default skin instead of the
+    // owner's — rather than taking the whole server down.
+    private static GameProfile createBotProfile(String ghostName, PropertyMap skinProperties) {
+        UUID botId = UUID.randomUUID();
+
+        // Same rule as PlayerSnapshot.capture(): PropertyMap's backing
+        // multimap becomes immutable as soon as it's constructed, so build
+        // the multimap fully first and construct the PropertyMap once.
+        com.google.common.collect.Multimap<String, Property> props = com.google.common.collect.HashMultimap.create();
+        props.putAll(skinProperties);
+        PropertyMap mutableProps = new PropertyMap(props);
+
+        try {
+            java.lang.reflect.Constructor<GameProfile> ctor =
+                    GameProfile.class.getConstructor(UUID.class, String.class, PropertyMap.class);
+            return ctor.newInstance(botId, ghostName, mutableProps);
+        } catch (NoSuchMethodException ignored) {
+            // No such constructor on this version — fall through to the field patch below.
+        } catch (ReflectiveOperationException e) {
+            LOGGER.error("nologout: failed to build bot profile via 3-arg GameProfile constructor", e);
+        }
+
+        GameProfile profile = new GameProfile(botId, ghostName);
+        try {
+            java.lang.reflect.Field propertiesField = GameProfile.class.getDeclaredField("properties");
+            propertiesField.setAccessible(true);
+            propertiesField.set(profile, mutableProps);
+        } catch (ReflectiveOperationException e) {
+            LOGGER.error("nologout: could not apply skin properties to bot profile for {} — bot will spawn with a default skin",
+                    ghostName, e);
+        }
+        return profile;
+    }
+
+    // -------------------------------------------------------------------------
     // Spawn bot from snapshot
     // -------------------------------------------------------------------------
 
@@ -244,7 +293,9 @@ public class PlayerBotManager {
         if (ghostName.length() > 16) {
             ghostName = ghostName.substring(0, 16);
         }
-        GameProfile profile = new GameProfile(UUID.randomUUID(), ghostName);
+        // Copy the real player's skin/cape textures onto the fake profile so
+        // the bot looks like the player it's standing in for.
+        GameProfile profile = createBotProfile(ghostName, snap.skinProperties);
         EntityPlayerMPFake bot = EntityPlayerMPFake.respawnFake(server, level, profile,
                 ClientInformation.createDefault());
 
@@ -277,7 +328,12 @@ public class PlayerBotManager {
         // and flag the bot red for the remainder of its duration.
         botSpawnTimestamps.put(snap.ownerUUID, spawnTimestamp);
         pendingCombatLogDeath.remove(snap.ownerUUID);
-        applyDangerNameTag(bot, server);
+        if (System.currentTimeMillis() - spawnTimestamp > COMBAT_LOG_WINDOW_MS) {
+            applyHiddenNameTag(bot, server);
+            botSpawnTimestamps.remove(snap.ownerUUID);
+        } else {
+            applyDangerNameTag(bot, server);
+        }
 
         server.getPlayerList().broadcastAll(
                 new ClientboundRotateHeadPacket(bot, (byte) (bot.yHeadRot * 256 / 360)),
@@ -347,7 +403,7 @@ public class PlayerBotManager {
 
         String botScoreboardName = bot.getScoreboardName();
         killBotQuietly(bot, "Player reconnected");
-        removeDangerNameTag(botScoreboardName, player.level().getServer());
+        removeNologoutNameTag(botScoreboardName, player.level().getServer());
         LOGGER.info("nologout: restored {} from ghost bot", player.getGameProfile().name());
     }
 
@@ -449,7 +505,7 @@ public class PlayerBotManager {
         EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
         if (bot != null) {
             killBotQuietly(bot, "Bot removed");
-            removeDangerNameTag(bot.getScoreboardName(), server);
+            removeNologoutNameTag(bot.getScoreboardName(), server);
         }
         botSpawnTimestamps.remove(ownerUUID);
     }
@@ -511,7 +567,7 @@ public class PlayerBotManager {
         // already dead; this just removes it from the world.
         EntityPlayerMPFake bot = activeBots.remove(ownerUUID);
         if (bot != null) {
-            removeDangerNameTag(bot.getScoreboardName(), server);
+            removeNologoutNameTag(bot.getScoreboardName(), server);
             if (!bot.isRemoved()) {
                 bot.discard();
             }
@@ -535,7 +591,7 @@ public class PlayerBotManager {
 
             EntityPlayerMPFake bot = activeBots.get(ownerUUID);
             if (bot != null) {
-                removeDangerNameTag(bot.getScoreboardName(), server);
+                applyHiddenNameTag(bot, server); // adding to a new team implicitly moves it off the danger team
             }
             botSpawnTimestamps.remove(ownerUUID);
         }
@@ -546,6 +602,9 @@ public class PlayerBotManager {
     // -------------------------------------------------------------------------
 
     private static void applyDangerNameTag(EntityPlayerMPFake bot, MinecraftServer server) {
+        // Danger window: stand normally so the red nametag is fully visible.
+        setBotSneaking(bot, false);
+
         Scoreboard scoreboard = server.getScoreboard();
         PlayerTeam team = scoreboard.getPlayerTeam(DANGER_TEAM_NAME);
         if (team == null) {
@@ -555,10 +614,31 @@ public class PlayerBotManager {
         scoreboard.addPlayerToTeam(bot.getScoreboardName(), team);
     }
 
-    private static void removeDangerNameTag(String scoreboardName, MinecraftServer server) {
+    // Applied once the combat-log window has passed. Rather than forcing the
+    // nametag invisible via a scoreboard team (which looked artificial and
+    // gave the bot away as fake), the bot is put into a permanent crouch.
+    // That makes its nametag behave exactly like a real sneaking player's —
+    // hidden/shortened visibility to other clients — using vanilla mechanics
+    // instead of an unconditional override.
+    private static void applyHiddenNameTag(EntityPlayerMPFake bot, MinecraftServer server) {
+        removeNologoutNameTag(bot.getScoreboardName(), server); // drop off the red team, if present
+        setBotSneaking(bot, true);
+    }
+
+    // Forces the bot's crouch/shift state (and pose, for an immediate visual
+    // update rather than waiting on the next tick) so its nametag visibility
+    // follows the same rules a real sneaking player's would.
+    private static void setBotSneaking(EntityPlayerMPFake bot, boolean sneaking) {
+        bot.setShiftKeyDown(sneaking);
+        bot.setPose(sneaking ? Pose.CROUCHING : Pose.STANDING);
+    }
+
+    // Removes a bot's scoreboard name from whichever nologout team it's
+    // currently in (danger or hidden) — used on cleanup so entries don't linger.
+    private static void removeNologoutNameTag(String scoreboardName, MinecraftServer server) {
         Scoreboard scoreboard = server.getScoreboard();
         PlayerTeam team = scoreboard.getPlayersTeam(scoreboardName);
-        if (team != null && team.getName().equals(DANGER_TEAM_NAME)) {
+        if (team != null && (team.getName().equals(DANGER_TEAM_NAME) || team.getName().equals(HIDDEN_TEAM_NAME))) {
             scoreboard.removePlayerFromTeam(scoreboardName, team);
         }
     }
@@ -727,6 +807,20 @@ public class PlayerBotManager {
         }
         tag.put("effects", effectList);
 
+        // Skin/cape texture properties, so the fake bot's appearance survives
+        // a server restart along with the rest of the snapshot.
+        ListTag skinList = new ListTag();
+        for (Property prop : snap.skinProperties.get("textures")) {
+            CompoundTag propTag = new CompoundTag();
+            propTag.putString("name", prop.name());
+            propTag.putString("value", prop.value());
+            if (prop.hasSignature()) {
+                propTag.putString("signature", prop.signature());
+            }
+            skinList.add(propTag);
+        }
+        tag.put("skinProperties", skinList);
+
         return tag;
     }
 
@@ -793,6 +887,23 @@ public class PlayerBotManager {
                             .ifPresent(snap.effects::add)
             );
         }
+
+        // Skin/cape texture properties
+        com.google.common.collect.Multimap<String, Property> props = com.google.common.collect.HashMultimap.create();
+        ListTag skinList = tag.getList("skinProperties").orElse(new ListTag());
+        for (int i = 0; i < skinList.size(); i++) {
+            skinList.getCompound(i).ifPresent(propTag -> {
+                String value = propTag.getString("value").orElse(null);
+                if (value == null) return;
+                String name = propTag.getString("name").orElse("textures");
+                String signature = propTag.getString("signature").orElse(null);
+                Property prop = signature != null
+                        ? new Property(name, value, signature)
+                        : new Property(name, value);
+                props.put(name, prop);
+            });
+        }
+        snap.skinProperties = new com.mojang.authlib.properties.PropertyMap(props);
 
         return snap;
     }
