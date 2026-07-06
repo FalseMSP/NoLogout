@@ -633,6 +633,10 @@ public class PlayerBotManager {
             }
             botSpawnTimestamps.remove(ownerUUID);
         }
+        // make them swim
+        for (EntityPlayerMPFake bot : activeBots.values()) {
+            setJumping(bot, bot.isInWater());
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -642,6 +646,9 @@ public class PlayerBotManager {
     private static void applyDangerNameTag(EntityPlayerMPFake bot, MinecraftServer server) {
         // Danger window: stand normally so the red nametag is fully visible.
         setBotSneaking(bot, false);
+
+        // make bot float if in water
+        if (bot.isInWater()) setJumping(bot, true);
 
         Scoreboard scoreboard = server.getScoreboard();
         PlayerTeam team = scoreboard.getPlayerTeam(DANGER_TEAM_NAME);
@@ -667,8 +674,13 @@ public class PlayerBotManager {
     // update rather than waiting on the next tick) so its nametag visibility
     // follows the same rules a real sneaking player's would.
     private static void setBotSneaking(EntityPlayerMPFake bot, boolean sneaking) {
-        bot.setShiftKeyDown(sneaking);
+        if (!bot.isInWater()) bot.setShiftKeyDown(sneaking);
         bot.setPose(sneaking ? Pose.CROUCHING : Pose.STANDING);
+    }
+
+    // Forces the bot to hold space
+    private static void setJumping(EntityPlayerMPFake bot, boolean jumping) {
+        bot.setJumping(jumping);
     }
 
     // Removes a bot's scoreboard name from whichever nologout team it's
