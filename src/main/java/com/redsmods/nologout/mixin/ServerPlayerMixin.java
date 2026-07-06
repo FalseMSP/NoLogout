@@ -7,6 +7,8 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.component.ItemLore;
 import net.minecraft.world.level.block.Blocks;
@@ -49,7 +51,9 @@ public abstract class ServerPlayerMixin {
 									.withStyle(style -> style.withItalic(false).withColor(ChatFormatting.GRAY))
 					)));
 
-			self.spawnAtLocation(self.level(), structureVoidStack);
+			ItemEntity itemEntity = self.spawnAtLocation(self.level(), structureVoidStack);
+            if (itemEntity != null) itemEntity.setUnlimitedLifetime();
+
 		}
 	}
 }
